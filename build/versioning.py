@@ -46,14 +46,25 @@ def stable_versions(all_tags: list[str]) -> list[Version]:
 
 
 def change_type(message: str) -> str:
-    """Find a semantic bump from a squash-commit message."""
-    first = message.splitlines()[0].strip() if message.strip() else ""
-    if re.match(r"^[a-z][\w-]*(\([^)]+\))?!:", first) or re.search(r"(?m)^BREAKING CHANGE:", message):
+    """Classify a squash commit or a GitHub merge commit.
+
+    GitHub's default merge message is e.g.:
+      Merge pull request #15 from owner/feature/foo
+
+      feat: add inventory
+    The PR title in the body is what must be classified.
+    """
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    candidates = lines[1:] if lines and lines[0].startswith("Merge pull request #") else lines[:1]
+    if re.search(r"(?mi)^BREAKING[ -]CHANGE\s*:", message):
         return "breaking"
-    if re.match(r"^feat(\([^)]+\))?:", first):
-        return "feat"
-    if re.match(r"^(fix|perf)(\([^)]+\))?:", first):
-        return "fix"
+    for line in candidates:
+        if re.match(r"^[a-z][\w-]*(\([^)]+\))?!:", line):
+            return "breaking"
+        if re.match(r"^feat(\([^)]+\))?:", line):
+            return "feat"
+        if re.match(r"^(fix|perf)(\([^)]+\))?:", line):
+            return "fix"
     return "none"
 
 
@@ -62,16 +73,44 @@ def bump(base: Version, kind: str) -> Version:
         return Version(base.major + 1, 0, 0)
     if kind == "feat":
         return Version(base.major, base.minor + 1, 0)
-    return Version(base.major, base.minor, base.patch + 1)
+    if kind == "fix":
+        return Version(base.major, base.minor, base.patch + 1)
+    return base  # docs/chore/test/ci do NOT increment PATCH
 
 
 def next_dev(stable: Version, previous: tuple[Version, int] | None, kind: str) -> tuple[Version, int]:
+    """Pick next pre-release build, preserving a higher, unpublished target."""
     candidate = bump(stable, kind)
     if previous is None or previous[0] <= stable:
         return (candidate, 1)
     base, index = previous
     new_base = max(base, candidate)
     return (new_base, index + 1 if new_base == base else 1)
+
+
+def unpublished_change_type(sha: str, stable_tag: str | None) -> str:
+    """Find strongest semantic change on develop since the last stable baseline.
+
+    Only first-parent commits are inspected to avoid double-counting the
+    individual commits in GitHub merge commits. If a stable release commit is
+    not directly on develop, use their merge base as the range boundary.
+    """
+    start = None
+    if stable_tag:
+        stable_commit = run("rev-parse", f"{stable_tag}^{{commit}}")
+        start = run("merge-base", stable_commit, sha)
+    revision_range = f"{start}..{sha}" if start else sha
+    commits = run("rev-list", "--first-parent", "--reverse", revision_range).splitlines()
+    ranking = {"none": 0, "fix": 1, "feat": 2, "breaking": 3}
+    strongest = "none"
+    for commit in commits:
+        # Before the initial release, ignore commit messages in the original
+        # repository bootstrap unless they are semantic changes.
+        message = run("show", "-s", "--format=%B", commit)
+        current = change_type(message)
+        if ranking[current] > ranking[strongest]:
+            strongest = current
+    return strongest
 
 
 def previous_dev_tag(all_tags: list[str], sha: str) -> tuple[Version, int] | None:
@@ -105,8 +144,10 @@ def calculate(kind: str, branch: str, sha: str) -> tuple[str, bool]:
         if existing:
             return existing, False
         prior = previous_dev_tag(all_tags, sha)
-        message = run("show", "-s", "--format=%B", sha)
-        version, number = next_dev(latest_stable, prior, change_type(message))
+        stable_tags = [t for t in all_tags if STABLE.fullmatch(t)]
+        latest_tag = max(stable_tags, key=lambda t: Version(*map(int, STABLE.fullmatch(t).groups()))) if stable_tags else None
+        semantic_kind = unpublished_change_type(sha, latest_tag)
+        version, number = next_dev(latest_stable, prior, semantic_kind)
         return f"v{version}-dev.{number}", True
 
     match = RELEASE_BRANCH.fullmatch(branch)
