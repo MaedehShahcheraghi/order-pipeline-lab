@@ -1,0 +1,17 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+.git/
+.github/
+.gitignore
+**/*Tests*/
+**/*.md
+**/*.sln
+build/
+deploy/
+docs/
+*.zip
+.env
+.env.*
+!*.env.example
