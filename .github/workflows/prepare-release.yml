@@ -1,0 +1,80 @@
+name: Prepare Release or Hotfix (automatic version/branch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'release from latest tagged develop; hotfix from latest stable'
+        type: choice
+        required: true
+        options: [release, hotfix]
+
+concurrency:
+  group: version-publisher-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout develop for release; main for hotfix
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.mode == 'release' && 'develop' || 'main' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch remote refs and tags
+        run: git fetch --force origin '+refs/heads/develop:refs/remotes/origin/develop' '+refs/heads/main:refs/remotes/origin/main' '+refs/tags/*:refs/tags/*'
+      - name: Compute branch and release cut
+        id: version
+        env:
+          MODE: ${{ inputs.mode }}
+        run: python3 build/versioning.py --kind "prepare-$MODE" --sha "$(git rev-parse HEAD)"
+      - name: Create protected release refs and trigger RC CI
+        env:
+          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+          CUT_TAG: ${{ steps.version.outputs.cut_tag }}
+          SOURCE_SHA: ${{ steps.version.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_BOT_TOKEN" ]]; then
+            echo 'Missing RELEASE_BOT_TOKEN: GitHub generated GITHUB_TOKEN cannot trigger new workflows on bot-created pushes.' >&2
+            exit 1
+          fi
+          git config user.name 'release-bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Push to PAT-authenticated remote, never echo/expose the token.
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0='http.https://github.com/.extraheader'
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$RELEASE_BOT_TOKEN" | base64 -w0)"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          if git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null; then
+            echo 'Branch already exists; refusing to overwrite' >&2; exit 1
+          else
+            code=$?
+            if [[ "$code" -ne 2 ]]; then echo 'Remote branch check failed' >&2; exit 1; fi
+          fi
+          # Reject competing release/hotfix branches targeting the same version.
+          ver="${BRANCH#*/}"
+          if [[ "$BRANCH" == hotfix/* ]]; then competitor="release/$ver"; else competitor="hotfix/$ver"; fi
+          if git ls-remote --exit-code origin "refs/heads/$competitor" >/dev/null; then
+            echo "Conflicting branch exists: $competitor" >&2; exit 1
+          else
+            code=$?
+            if [[ "$code" -ne 2 ]]; then echo 'Competitor branch check failed' >&2; exit 1; fi
+          fi
+          if [[ -n "$CUT_TAG" ]]; then
+            git tag -a "$CUT_TAG" "$SOURCE_SHA" -m "Release cut $BRANCH at $SOURCE_SHA"
+            # Atomic push: both cut anchor and release branch, or neither.
+            git push --atomic origin "refs/tags/$CUT_TAG:refs/tags/$CUT_TAG" "$SOURCE_SHA:refs/heads/$BRANCH"
+          else
+            git push origin "$SOURCE_SHA:refs/heads/$BRANCH"
+          fi
+          echo "Created $BRANCH; RC workflow should start from GitHub PAT-authenticated push"
