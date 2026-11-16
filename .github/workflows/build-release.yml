@@ -2,123 +2,196 @@ name: Version, Build and Publish
 
 on:
   push:
-    branches:
-      - develop
-      - 'release/**'
+    branches: [develop, 'release/**', 'hotfix/**']
   pull_request:
     branches: [main]
     types: [closed]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Recovery: stable on main; dev on develop; rc on release/hotfix branch'
+        required: true
+        type: choice
+        options: [stable, dev, rc]
+      source_branch:
+        description: 'For stable only: exact merged branch e.g. release/0.1.0'
+        required: false
+        type: string
 
+# Stable/tag allocation and cut jobs serialize on the same protected ref namespace.
 concurrency:
-  group: release-tags-${{ github.repository }}
+  group: version-publisher-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
   contents: write
   packages: write
+  pull-requests: read
 
 jobs:
   publish:
     if: >-
       (github.event_name == 'push') ||
       (github.event_name == 'workflow_dispatch' &&
-       (github.ref_name == 'develop' || startsWith(github.ref_name, 'release/'))) ||
+        ((inputs.mode == 'stable' && github.ref == 'refs/heads/main') ||
+         (inputs.mode == 'dev' && github.ref == 'refs/heads/develop') ||
+         (inputs.mode == 'rc' && (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/hotfix/'))))) ||
       (github.event_name == 'pull_request' && github.event.pull_request.merged == true &&
+       github.event.pull_request.base.ref == 'main' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
        (startsWith(github.event.pull_request.head.ref, 'release/') ||
         startsWith(github.event.pull_request.head.ref, 'hotfix/')))
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
-      - name: Checkout exact commit with full history
+      - name: Checkout exact commit with all tags
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 0
-      - name: Fetch all Git tags
-        run: git fetch --force --tags origin
-      - name: Select versioning mode
+          persist-credentials: true
+      - name: Fetch tags and main
+        run: git fetch --force origin '+refs/heads/main:refs/remotes/origin/main' '+refs/tags/*:refs/tags/*'
+      - name: Choose release mode
         id: mode
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          CURRENT_BRANCH: ${{ github.ref_name }}
-          PR_HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref_name }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          REQUESTED_MODE: ${{ inputs.mode }}
+          REQUESTED_SOURCE: ${{ inputs.source_branch }}
+        shell: bash
         run: |
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            echo "kind=stable" >> "$GITHUB_OUTPUT"
-            echo "branch=$PR_HEAD_BRANCH" >> "$GITHUB_OUTPUT"
-          elif [[ "$CURRENT_BRANCH" == "develop" ]]; then
-            echo "kind=dev" >> "$GITHUB_OUTPUT"
-            echo "branch=develop" >> "$GITHUB_OUTPUT"
-          elif [[ "$CURRENT_BRANCH" == release/* ]]; then
-            echo "kind=rc" >> "$GITHUB_OUTPUT"
-            echo "branch=$CURRENT_BRANCH" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [[ "$EVENT" == 'pull_request' ]]; then
+            kind=stable; branch="$PR_HEAD"
+          elif [[ "$EVENT" == 'workflow_dispatch' ]]; then
+            kind="$REQUESTED_MODE"
+            if [[ "$kind" == 'stable' ]]; then branch="$REQUESTED_SOURCE"; else branch="$REF"; fi
+          elif [[ "$REF" == 'develop' ]]; then
+            kind=dev; branch=develop
           else
-            echo "Unsupported publish event / branch: $CURRENT_BRANCH" >&2
-            exit 1
+            kind=rc; branch="$REF"
           fi
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Restore and test BEFORE publishing
+      - name: Restore and test before publishing
+        shell: bash
         run: |
+          set -euo pipefail
           dotnet restore OrderPipelineLab.sln
           dotnet test tests/OrderPipeline.UnitTests/OrderPipeline.UnitTests.csproj -c Release --no-restore
           python3 -m unittest discover -s build/tests -p 'test_*.py' -v
-      - name: Compute version from Git history
+      - name: Calculate version and verify Git lineage
         id: version
         env:
           KIND: ${{ steps.mode.outputs.kind }}
           BRANCH: ${{ steps.mode.outputs.branch }}
+        run: python3 build/versioning.py --kind "$KIND" --branch "$BRANCH" --sha "$(git rev-parse HEAD)"
+      - name: Compute image repository and tags
+        id: image
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
         run: |
-          python3 build/versioning.py --kind "$KIND" --branch "$BRANCH" --sha "$(git rev-parse HEAD)"
-      - name: Compute lowercase container repository
-        id: repo
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "repo=$image" >> "$GITHUB_OUTPUT"
+          {
+            echo 'tags<<END_TAGS'
+            if [[ -n "$TAG" ]]; then echo "$image:$VERSION"; fi
+            echo "$image:sha-$SHORT_SHA"
+            echo 'END_TAGS'
+          } >> "$GITHUB_OUTPUT"
       - name: Enable Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to GitHub Container Registry
+      - name: Login to GHCR
+        if: steps.version.outputs.reason != 'awaiting hotfix commit' && (steps.version.outputs.new == 'true' || steps.version.outputs.tag == '')
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and publish versioned image
+      - name: Build/push dev or RC (SHA-only for non-releasable changes)
+        if: steps.mode.outputs.kind != 'stable' && steps.version.outputs.reason != 'awaiting hotfix commit' && (steps.version.outputs.new == 'true' || steps.version.outputs.tag == '')
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           platforms: linux/amd64
-          tags: |
-            ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.version }}
-            ${{ steps.repo.outputs.image }}:sha-${{ steps.version.outputs.short_sha }}
+          tags: ${{ steps.image.outputs.tags }}
           build-args: |
             APP_VERSION=${{ steps.version.outputs.version }}
+            ASSEMBLY_VERSION=${{ steps.version.outputs.tag != '' && steps.version.outputs.version || '0.0.0-ci' }}
             VCS_REF=${{ steps.version.outputs.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Deliberately NO 'cache-to: type=gha': PR-close events lack writable cache.
+          # Correctness and permissions are preferred over cache speed.
           provenance: true
           sbom: true
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ steps.version.outputs.sha }}
-      - name: Create and push IMMUTABLE Git tag after successful image push
+      - name: Promote exact tested RC to stable (no rebuild)
+        if: steps.mode.outputs.kind == 'stable' && steps.version.outputs.new == 'true'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.repo }}
+          RC: ${{ steps.version.outputs.source_rc }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # RC image was published BEFORE its immutable Git tag was created.
+          docker buildx imagetools inspect "$IMAGE:${RC#v}"
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" "$IMAGE:${RC#v}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+      - name: Create immutable Git tag only after image publication
         if: steps.version.outputs.new == 'true'
+        shell: bash
         env:
           TAG: ${{ steps.version.outputs.tag }}
           SHA: ${{ steps.version.outputs.sha }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git tag -a "$TAG" "$SHA" -m "Published $TAG"
           git push origin "refs/tags/$TAG"
-      - name: Show published artifact
+      - name: Open DRAFT Release/Hotfix PR after first RC
+        if: steps.mode.outputs.kind == 'rc' && steps.version.outputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          BRANCH: ${{ steps.mode.outputs.branch }}
         run: |
-          echo "Version: ${{ steps.version.outputs.version }}"
-          echo "Git tag: ${{ steps.version.outputs.tag }}"
-          echo "Commit: ${{ steps.version.outputs.sha }}"
-          echo "Image: ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.version }}"
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo 'RELEASE_BOT_TOKEN missing: create a PR manually; RC already published.'
+            exit 0
+          fi
+          if [[ "$BRANCH" == release/* ]]; then
+            title="release: ${BRANCH#release/}"
+          else
+            title="fix: production hotfix ${BRANCH#hotfix/}"
+          fi
+          count="$(gh pr list --head "$BRANCH" --state all --json number --jq 'length')"
+          if [[ "$count" == '0' ]]; then
+            gh pr create --draft --base main --head "$BRANCH" --title "$title" \
+              --body 'Automatically opened after successful RC. QA must validate and approve; use Create a merge commit (not squash).'
+          fi
+      - name: Report publication
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REASON: ${{ steps.version.outputs.reason }}
+        run: |
+          echo "Version / artifact: $VERSION"
+          echo "Git tag: ${TAG:-'(SHA-only build)'}"
+          echo "Reason: $REASON"
