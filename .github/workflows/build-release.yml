@@ -131,8 +131,8 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.version }}
             ASSEMBLY_VERSION=${{ steps.version.outputs.tag != '' && steps.version.outputs.version || '0.0.0-ci' }}
             VCS_REF=${{ steps.version.outputs.sha }}
-          # Deliberately NO 'cache-to: type=gha': PR-close events lack writable cache.
-          # Correctness and permissions are preferred over cache speed.
+          cache-from: type=gha
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
           provenance: true
           sbom: true
           labels: |
