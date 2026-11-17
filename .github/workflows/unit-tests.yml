@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Validate PR policy
         if: github.event_name == 'pull_request'
         env:
@@ -27,6 +29,16 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: python3 build/validate_pr.py
+      - name: Verify main PR uses exact tested RC tree
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin '+refs/tags/*:refs/tags/*'
+          python3 build/release_guard.py pre-merge --head-ref "$PR_HEAD_REF" --head-sha "$PR_HEAD_SHA"
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
         with:

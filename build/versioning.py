@@ -301,6 +301,9 @@ def main() -> int:
     p.add_argument("--sha", default="HEAD")
     a = p.parse_args()
     sha = git("rev-parse", f"{a.sha}^{{commit}}")
+    if a.kind == "prepare-release":
+        from release_guard import cut_guard
+        cut_guard()  # Check develop-vs-main publisher before any cut ref is pushed.
     if a.kind.startswith("prepare-"):
         branch, cut, base_sha = prepare(a.kind.removeprefix("prepare-"), sha)
         outputs = {"branch": branch, "cut_tag": cut, "sha": base_sha, "base_sha": base_sha}
