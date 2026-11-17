@@ -30,6 +30,9 @@ jobs:
           persist-credentials: false
       - name: Fetch remote refs and tags
         run: git fetch --force origin '+refs/heads/develop:refs/remotes/origin/develop' '+refs/heads/main:refs/remotes/origin/main' '+refs/tags/*:refs/tags/*'
+      - name: Refuse a release cut when publisher differs from main
+        if: inputs.mode == 'release'
+        run: python3 build/release_guard.py pre-cut
       - name: Compute branch and release cut
         id: version
         env:
