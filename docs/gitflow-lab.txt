@@ -1,2 +1,3 @@
 GitFlow Practice
 Feature: Inventory is enabled
+Fix: Payment calculation corrected
